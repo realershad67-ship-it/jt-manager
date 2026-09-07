@@ -1543,10 +1543,23 @@ select option { background: var(--surface3); color: var(--ink); }
   display: inline-flex; overflow: hidden;
 }
 .task-card-timer-clickable {
-  cursor: pointer; user-select: none; transition: transform 0.12s ease, box-shadow 0.12s ease;
+  cursor: pointer; user-select: none; touch-action: manipulation;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 .task-card-timer-clickable:hover { transform: translateY(-1px); box-shadow: 0 0 22px rgba(255,90,30,0.65); }
 .task-card-timer-clickable:active { transform: translateY(0); }
+/* Hold-to-complete: a fill sweeps left→right over the 2s hold; releasing
+   early (or the pointer leaving) cancels it via .task-card-timer-holding
+   being removed, which resets the transition instantly (see JS). */
+.task-card-timer-clickable.task-card-timer-holding::after {
+  content: ''; position: absolute; inset: 0; z-index: 0;
+  background: rgba(255,255,255,0.32);
+  transform-origin: left center; transform: scaleX(0);
+  transition: transform 2s linear;
+}
+.task-card-timer-clickable.task-card-timer-holding.task-card-timer-hold-fill::after {
+  transform: scaleX(1);
+}
 .task-card-timer-clickable.step-1 { background: linear-gradient(135deg, #7b5cff, #b03dff); border-color: #a06bff; box-shadow: 0 0 18px rgba(140,80,255,0.45); }
 .task-card-timer-clickable.step-2 { background: linear-gradient(135deg, #1a9c4a, #17b56b); border-color: #3fd17f; box-shadow: 0 0 18px rgba(30,190,110,0.45); }
 .task-card-timer-action {
@@ -5177,7 +5190,19 @@ function computeTaskList(accId, setId, exceptMode, hideCompletedForAcc) {
     const bArch = b.archived ? 1 : 0;
     if (aArch !== bArch) return aArch - bArch;
     // Status-based sorts (only for non-archived)
-    if (taskSort === 'assigned')      { const d = countAsgns(b,'assigned')  - countAsgns(a,'assigned');  if(d!==0) return d; }
+    if (taskSort === 'assigned') {
+      // In-progress tasks should read lastly-assigned first, oldest last —
+      // not grouped by how many accounts are on them. Rank by the most
+      // recent assignedAt among each task's currently-"assigned" (in
+      // progress) assignments; tasks with none fall to the bottom of the group.
+      const latestAssignedAt = (t) => {
+        let latest = '';
+        (t.assignments||[]).forEach(a => { if (a.status === 'assigned' && (a.assignedAt||'') > latest) latest = a.assignedAt || ''; });
+        return latest;
+      };
+      const d = latestAssignedAt(b).localeCompare(latestAssignedAt(a));
+      if (d!==0) return d;
+    }
     if (taskSort === 'completed')     { const d = countAsgns(b,'completed') - countAsgns(a,'completed'); if(d!==0) return d; }
     if (taskSort === 'rewarded')      { const d = countAsgns(b,'rewarded')  - countAsgns(a,'rewarded');  if(d!==0) return d; }
     if (taskSort === 'unassigned' || taskSort === 'unassigned_only') {
@@ -5698,7 +5723,8 @@ function renderTaskCard(task, dualAccId) {
     const s = totalSec % 60;
     return (h > 0 ? h + ':' + String(m).padStart(2,'0') : String(m).padStart(2,'0')) + ':' + String(s).padStart(2,'0');
   }
-  const inProgressAsgns = asgns.filter(a => a.status === 'assigned');
+  const inProgressAsgns = asgns.filter(a => a.status === 'assigned')
+    .sort((a,b) => (b.assignedAt||'').localeCompare(a.assignedAt||''));
   const timerHtml = (!hasError && inProgressAsgns.length) ? `
     <div class="task-card-timers">
       ${inProgressAsgns.map(a => {
@@ -5725,7 +5751,7 @@ function renderTaskCard(task, dualAccId) {
         const morphPos = _morphClickPos[a.id];
         const morphStyle = (stepChanged && morphPos) ? ` style="--morph-x:${morphPos.x};--morph-y:${morphPos.y};"` : '';
         return `
-          <div class="task-card-timer-wrap task-card-timer-clickable step-${step}${stepChanged ? ' step-morphed' : ''}"${morphStyle} onclick="taskCardStepClick('${task.id}','${a.id}',event)" title="${stepInfo.hint}">
+          <div class="task-card-timer-wrap task-card-timer-clickable step-${step}${stepChanged ? ' step-morphed' : ''}"${morphStyle} onpointerdown="taskCardTimerDown('${task.id}','${a.id}',event)" onpointerup="taskCardTimerUp('${task.id}','${a.id}',event)" onpointerleave="taskCardTimerCancel('${task.id}','${a.id}',event)" onpointercancel="taskCardTimerCancel('${task.id}','${a.id}',event)" title="${stepInfo.hint} · hold 2s to complete">
             <span class="task-card-timer-label">◷ ${acc ? htmlEscape(acc.name) : 'In Progress'}</span>
             <span class="task-card-timer" data-start="${startEpoch}">${timerCharsHtml(elapsed)}</span>
             <span class="task-card-timer-action">${stepInfo.icon} ${stepInfo.label}</span>
@@ -10167,6 +10193,55 @@ window.taskCardStepClick = function(taskId, asgnId, evt) {
   else if (step === 1) window.acStepVisit(taskId, asgnId);
   else window.acStepComplete(taskId, asgnId);
   renderTasks();
+};
+
+// ── Hold-to-complete ──────────────────────────────────────────────────────
+// Holding the timer pill for 2s jumps straight to "Completed" no matter which
+// step (search/visited/complete) it's currently on. A normal tap (release
+// before 2s) still runs the regular one-step-at-a-time taskCardStepClick.
+const TASK_CARD_HOLD_MS = 2000;
+const _taskCardHoldTimers = {};
+const _taskCardHoldFired = {};
+
+function _taskCardHoldClearVisual(el) {
+  if (el) el.classList.remove('task-card-timer-holding', 'task-card-timer-hold-fill');
+}
+
+window.taskCardTimerDown = function(taskId, asgnId, evt) {
+  const el = evt && evt.currentTarget;
+  if (_taskCardHoldTimers[asgnId]) clearTimeout(_taskCardHoldTimers[asgnId]);
+  _taskCardHoldFired[asgnId] = false;
+  if (el) {
+    el.classList.add('task-card-timer-holding');
+    // Add the fill class a tick later so the scaleX transition actually runs.
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('task-card-timer-hold-fill')));
+  }
+  _taskCardHoldTimers[asgnId] = setTimeout(() => {
+    _taskCardHoldFired[asgnId] = true;
+    _taskCardHoldClearVisual(el);
+    window.acStepComplete(taskId, asgnId);
+    renderTasks();
+  }, TASK_CARD_HOLD_MS);
+};
+
+window.taskCardTimerUp = function(taskId, asgnId, evt) {
+  const el = evt && evt.currentTarget;
+  if (_taskCardHoldTimers[asgnId]) { clearTimeout(_taskCardHoldTimers[asgnId]); delete _taskCardHoldTimers[asgnId]; }
+  _taskCardHoldClearVisual(el);
+  if (_taskCardHoldFired[asgnId]) {
+    // Hold already completed the task on its own — don't also treat the
+    // release as a tap.
+    _taskCardHoldFired[asgnId] = false;
+    return;
+  }
+  window.taskCardStepClick(taskId, asgnId, evt);
+};
+
+window.taskCardTimerCancel = function(taskId, asgnId, evt) {
+  const el = evt && evt.currentTarget;
+  if (_taskCardHoldTimers[asgnId]) { clearTimeout(_taskCardHoldTimers[asgnId]); delete _taskCardHoldTimers[asgnId]; }
+  _taskCardHoldClearVisual(el);
+  _taskCardHoldFired[asgnId] = false;
 };
 
 window.acStepSearch = function(taskId, asgnId) {
